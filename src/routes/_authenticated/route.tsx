@@ -23,10 +23,18 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | null> {
 export const Route = createFileRoute("/_authenticated")({
   ssr: false,
   beforeLoad: async () => {
-    // Timeout at 5 s — if Supabase doesn't respond (no network, slow cold
-    // start) we redirect to sign-in rather than hanging forever on a loading
-    // screen. The user can retry once the connection is restored.
-    const result = await withTimeout(supabase.auth.getUser(), 5000);
+    // 1. First check local session (instant, works offline without network delay)
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (sessionData.session?.user) {
+        return { user: sessionData.session.user };
+      }
+    } catch {
+      // Ignore local storage read errors and continue to getUser
+    }
+
+    // 2. If no valid local session exists, verify with Supabase Auth with a 3s timeout
+    const result = await withTimeout(supabase.auth.getUser(), 3000);
     if (!result || result.error || !result.data.user) {
       throw redirect({ to: "/signin" });
     }

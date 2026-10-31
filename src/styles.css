@@ -182,12 +182,16 @@ body.light {
   * {
     border-color: var(--color-border);
   }
-  body {
+  html, body {
     background: var(--gradient-page);
     background-attachment: fixed;
     color: var(--color-foreground);
     font-family: var(--font-sans);
     min-height: 100vh;
+    min-height: 100dvh;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
+    overscroll-behavior: none;
   }
   h1,
   h2,
@@ -203,6 +207,11 @@ body.light {
   [role="button"],
   [tabindex] {
     touch-action: manipulation;
+  }
+  button,
+  [role="button"] {
+    user-select: none;
+    -webkit-user-select: none;
   }
   input,
   textarea {

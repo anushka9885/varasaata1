@@ -5,7 +5,7 @@
 export const ADMOB_APP_ID = "ca-app-pub-9580341378631539~2782824357";
 
 const PROD = {
-  banner: "ca-app-pub-9580341378631539/7942702687",
+  banner: "ca-app-pub-9580341378631539/7942072687",
   interstitial: "ca-app-pub-9580341378631539/5464828011",
 };
 const TEST = {
@@ -60,8 +60,12 @@ export function initAds(): Promise<AdMobMod | null> {
         }
         canRequestAds = info.canRequestAds ?? info.status !== mod.AdmobConsentStatus.REQUIRED;
       } catch (error) {
-        console.warn("[Ads] Consent status unavailable; ads disabled for this session:", error);
-        canRequestAds = false;
+        console.warn("[Ads] Consent status check notice:", error);
+        canRequestAds = !ADS_PRODUCTION;
+      }
+      // In development/test mode, always allow test ad unit requests
+      if (!ADS_PRODUCTION) {
+        canRequestAds = true;
       }
       if (canRequestAds) void prepareInterstitial(mod);
       return mod;
@@ -71,6 +75,11 @@ export function initAds(): Promise<AdMobMod | null> {
     }
   })();
   return ready;
+}
+
+/** Cancels any pending interstitial state when navigating away or restarting */
+export function cancelPendingAds(): void {
+  interstitialBusy = false;
 }
 
 /** Lets users revisit their ad privacy choices on supported native platforms. */

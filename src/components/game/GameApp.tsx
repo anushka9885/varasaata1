@@ -64,22 +64,27 @@ import {
 } from "@/game/engine";
 import { chooseMove, type Difficulty } from "@/game/ai";
 import { playTone, setSoundVolume } from "@/game/sound";
-import { hideBanner, initAds, maybeShowInterstitial, showBanner } from "@/lib/ads";
+import { cancelPendingAds, hideBanner, initAds, maybeShowInterstitial, showBanner } from "@/lib/ads";
 import { translations, type Language } from "@/lib/i18n";
 import {
   createRoom,
   joinRoom,
   getRoom,
+  fetchRoom,
   updateRoomGame,
-  getFriends,
-  getFriendRequests,
-  sendFriendRequest,
-  acceptFriendRequest,
+  searchRegisteredPlayers,
+  sendGameInvitation,
+  getIncomingInvitations,
+  respondToInvitation,
+  subscribeToInvitations,
+  subscribeToRoom,
   type OnlineRoom,
-  type Friend,
-  type FriendRequest,
+  type RegisteredPlayer,
+  type GameInvitation,
 } from "@/lib/online";
 import { subscribeToCrossTab } from "@/integrations/supabase/mock-client";
+import { triggerHaptic } from "@/lib/haptics";
+import { registerBackHandler } from "@/lib/back-button";
 
 export const AVATARS = ["🦚", "🐘", "🐅", "🪷", "🦁", "🦅", "🐎", "🌞", "👑", "⚔️", "💎", "🪔"];
 
@@ -162,14 +167,22 @@ export function GameApp({ userId }: { userId: string }) {
   const [dialog, setDialog] = useState<Dlg>(null);
   const scoredRef = useRef(false);
   const roundStarterRef = useRef<Player>(1);
+  const startMatchRef = useRef<() => void>(() => {});
 
-  // Online Multiplayer State
+  // Online Multiplayer & Invitations State
+  const [currentUsername, setCurrentUsername] = useState("");
   const [currentRoom, setCurrentRoom] = useState<OnlineRoom | null>(null);
   const [joinCodeInput, setJoinCodeInput] = useState("");
   const [copiedCode, setCopiedCode] = useState(false);
-  const [friendsList, setFriendsList] = useState<Friend[]>([]);
-  const [friendRequests, setFriendRequests] = useState<FriendRequest[]>([]);
-  const [friendSearchInput, setFriendSearchInput] = useState("");
+  const [playerSearchInput, setPlayerSearchInput] = useState("");
+  const [searchedPlayers, setSearchedPlayers] = useState<RegisteredPlayer[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [incomingInvitations, setIncomingInvitations] = useState<GameInvitation[]>([]);
+  const [outgoingInvitation, setOutgoingInvitation] = useState<{
+    toUser: RegisteredPlayer;
+    roomCode: string;
+    invitationId?: string | undefined;
+  } | null>(null);
 
   // Settings State (Change Password)
   const [passwordState, setPasswordState] = useState({
@@ -214,12 +227,34 @@ export function GameApp({ userId }: { userId: string }) {
     if (playing) void hideBanner();
     else void showBanner();
   }, [playing]);
-  useEffect(
-    () => () => {
-      void hideBanner();
-    },
-    [],
-  );
+  // Register Android hardware back button handler
+  useEffect(() => {
+    const unregister = registerBackHandler(() => {
+      // 1. If any dialog is open, dismiss it
+      if (dialog !== null) {
+        setDialog(null);
+        return true;
+      }
+      // 2. If actively playing a match
+      if (playing) {
+        if (matchOver) {
+          setPlaying(false);
+        } else {
+          setDialog("back");
+        }
+        return true;
+      }
+      // 3. If in a sub-tab, return to the main "play" tab
+      if (activeTab !== "play") {
+        setActiveTab("play");
+        return true;
+      }
+      // 4. Default: allow exit or browser back
+      return false;
+    });
+    return unregister;
+  }, [dialog, playing, matchOver, activeTab, matchOver]);
+
 
   const paused = dialog !== null;
   const isAiTurn = settings.mode === "ai" && game.turn === 2 && game.winner === null;
@@ -273,7 +308,10 @@ export function GameApp({ userId }: { userId: string }) {
                 ? "Online Opponent"
                 : "Local Player 2",
           mode: row.mode || "ai",
-          result: row.result,
+          result: (row.result === "win" || row.result === "loss" ? row.result : "draw") as
+            | "draw"
+            | "win"
+            | "loss",
           score: [row.rounds_won || 0, row.rounds_lost || 0],
           date: row.created_at ? new Date(row.created_at).toLocaleDateString() : "Recent",
         })),
@@ -289,9 +327,10 @@ export function GameApp({ userId }: { userId: string }) {
         .eq("user_id", userId)
         .maybeSingle();
       if (data) {
+        if (data.username) setCurrentUsername(data.username);
         setSettings((s) => ({
           ...s,
-          names: [data.display_name || "You", s.names[1]],
+          names: [data.display_name || data.username || "You", s.names[1]],
           avatars: [data.avatar || "🦚", s.avatars[1]],
           colors: [data.p1_color || "emerald", data.p2_color || "ruby"],
           boardTheme: (data.board_theme as BoardTheme) || "wood",
@@ -303,30 +342,87 @@ export function GameApp({ userId }: { userId: string }) {
       setProfileLoaded(true);
     })();
     loadStats();
-    setFriendsList(getFriends(userId));
-    setFriendRequests(getFriendRequests(userId));
   }, [userId, loadStats]);
 
-  // Cross-Tab & Online Multiplayer Sync
+  // Realtime subscription for invitations
   useEffect(() => {
-    const unsub = subscribeToCrossTab((type, payload) => {
-      if (type === "lobby_event") {
-        const { action, payload: data } = payload;
-        if (action === "game_move" && currentRoom && data.code === currentRoom.code) {
-          setGame(data.gameState);
-          sfx("place");
-        } else if (action === "player_joined" && currentRoom && data.code === currentRoom.code) {
-          setCurrentRoom(data);
-          toast.success(`${data.guestName || "Opponent"} joined the lobby!`);
-          sfx("win");
-        } else if (action === "friend_request" && data.toId === `to_${settings.names[0]}`) {
-          setFriendRequests(getFriendRequests(userId));
-          toast.info(`New friend request from ${data.fromName}!`);
-        }
-      }
+    if (!userId) return;
+
+    getIncomingInvitations(userId).then((list) => {
+      setIncomingInvitations(list);
     });
+
+    const unsub = subscribeToInvitations(
+      userId,
+      (newInv) => {
+        setIncomingInvitations((prev) => {
+          if (prev.some((i) => i.id === newInv.id)) return prev;
+          sfx("mill");
+          toast.info(`Game challenge received from @${newInv.fromUsername}!`);
+          return [newInv, ...prev];
+        });
+      },
+      (response) => {
+        if (response.id && outgoingInvitation && response.id === outgoingInvitation.invitationId) {
+          if (response.status === "accepted") {
+            sfx("win");
+            toast.success(`@${outgoingInvitation.toUser.username} accepted your challenge!`);
+            if (response.roomCode) {
+              fetchRoom(response.roomCode).then((r) => {
+                if (r) {
+                  setCurrentRoom(r);
+                  setSettings((s) => ({
+                    ...s,
+                    mode: "online",
+                    names: [
+                      s.names[0],
+                      outgoingInvitation.toUser.displayName || outgoingInvitation.toUser.username,
+                    ],
+                    avatars: [s.avatars[0], outgoingInvitation.toUser.avatar],
+                    colors: [r.hostColor, r.guestColor],
+                  }));
+                  setOutgoingInvitation(null);
+                  startMatchRef.current();
+                }
+              });
+            }
+          } else if (response.status === "declined") {
+            sfx("error");
+            toast.error(`@${outgoingInvitation.toUser.username} declined your invitation.`);
+            setOutgoingInvitation(null);
+          }
+        }
+      },
+    );
+
     return unsub;
-  }, [currentRoom, userId, settings.names, sfx]);
+  }, [userId, outgoingInvitation, sfx]);
+
+  // Online Room State Synchronization
+  useEffect(() => {
+    if (!currentRoom?.code || settings.mode !== "online") return;
+
+    const unsub = subscribeToRoom(currentRoom.code, {
+      onMove: (remoteGameState) => {
+        setGame(remoteGameState);
+        sfx("place");
+      },
+      onRoomUpdated: (updatedRoom) => {
+        setCurrentRoom(updatedRoom);
+        if (updatedRoom.guestName && !playing) {
+          toast.success(`${updatedRoom.guestName} joined the room!`);
+          sfx("win");
+          setSettings((s) => ({
+            ...s,
+            names: [s.names[0], updatedRoom.guestName || "Guest"],
+            avatars: [s.avatars[0], updatedRoom.guestAvatar || "🐅"],
+          }));
+        }
+      },
+    });
+
+    return unsub;
+  }, [currentRoom?.code, settings.mode, playing, sfx]);
 
   const savePrefs = async (s: AppSettings) => {
     sfx("click");
@@ -365,6 +461,7 @@ export function GameApp({ userId }: { userId: string }) {
       return toast.error("Choose two different stone colours.");
     }
     sfx("click");
+    cancelPendingAds();
     savePrefs(settings);
     setScores([0, 0]);
     setRound(1);
@@ -373,6 +470,7 @@ export function GameApp({ userId }: { userId: string }) {
     setPlaying(true);
     setActiveTab("play");
   };
+  startMatchRef.current = startMatch;
 
   const commit = (next: GameState, prev: GameState) => {
     setHistory((h) => [...h, prev]);
@@ -384,11 +482,14 @@ export function GameApp({ userId }: { userId: string }) {
 
     if (next.lastMove?.captured !== undefined && prev.pendingCapture) {
       sfx("capture");
+      void triggerHaptic("heavy");
     } else if (next.pendingCapture) {
       sfx("mill");
+      void triggerHaptic("success");
       toast.success(t.formedMill);
     } else {
       sfx("place");
+      void triggerHaptic("medium");
     }
   };
 
@@ -404,6 +505,7 @@ export function GameApp({ userId }: { userId: string }) {
       if (game.pendingCapture) {
         if (!capturable(game).includes(i)) {
           sfx("error");
+          void triggerHaptic("warning");
           return toast.message(
             game.board[i] === other(game.turn) ? t.protectedByMill : t.chooseOpponentStone,
           );
@@ -418,9 +520,11 @@ export function GameApp({ userId }: { userId: string }) {
         setSelected(movesFrom(game, i).length ? i : null);
         if (!movesFrom(game, i).length) {
           sfx("error");
+          void triggerHaptic("warning");
           toast.message(t.noFreeNeighbours);
         } else {
           sfx("click");
+          void triggerHaptic("light");
         }
         return;
       }
@@ -431,6 +535,7 @@ export function GameApp({ userId }: { userId: string }) {
     } catch (e) {
       if (e instanceof IllegalMoveError) {
         sfx("error");
+        void triggerHaptic("warning");
         toast.message(e.message);
       } else throw e;
     }
@@ -493,12 +598,19 @@ export function GameApp({ userId }: { userId: string }) {
     }
     setScores(ns);
 
-    if (game.winner === 1) sfx("win");
-    else if (game.winner === 2) sfx("lose");
+    if (game.winner === 1) {
+      sfx("win");
+      void triggerHaptic("success");
+    } else if (game.winner === 2) {
+      sfx("lose");
+      void triggerHaptic("warning");
+    }
 
     const need = Math.ceil(settings.rounds / 2);
     if (ns[0] >= need || ns[1] >= need || round >= settings.rounds) {
       setMatchOver(true);
+      if (ns[0] > ns[1]) void triggerHaptic("success");
+      else if (ns[0] < ns[1]) void triggerHaptic("error");
       setTimeout(() => void maybeShowInterstitial(), 1500);
       const result = ns[0] > ns[1] ? "win" : ns[0] < ns[1] ? "loss" : "draw";
 
@@ -550,6 +662,7 @@ export function GameApp({ userId }: { userId: string }) {
   };
 
   const quit = () => {
+    cancelPendingAds();
     setDialog(null);
     setPlaying(false);
   };
@@ -583,10 +696,10 @@ export function GameApp({ userId }: { userId: string }) {
     }
   };
 
-  // Online Multiplayer Handlers
-  const handleCreateRoom = () => {
+  // Online Multiplayer & Real Invitation Handlers
+  const handleCreateRoom = async () => {
     sfx("click");
-    const room = createRoom(userId, settings.names[0], settings.avatars[0], {
+    const room = await createRoom(userId, settings.names[0], settings.avatars[0], {
       hostColor: settings.colors[0],
       guestColor: settings.colors[1],
       timer: settings.timer,
@@ -594,13 +707,13 @@ export function GameApp({ userId }: { userId: string }) {
     });
     setCurrentRoom(room);
     setSettings((s) => ({ ...s, mode: "online" }));
-    toast.success(`Room ${room.code} created! Share with your friend.`);
+    toast.success(`Room ${room.code} created! Share code with your friend.`);
   };
 
-  const handleJoinRoom = () => {
+  const handleJoinRoom = async () => {
     if (!joinCodeInput.trim()) return toast.error("Enter a room code.");
     sfx("click");
-    const room = joinRoom(joinCodeInput, userId, settings.names[0], settings.avatars[0]);
+    const room = await joinRoom(joinCodeInput, userId, settings.names[0], settings.avatars[0]);
     if (!room) return toast.error("Room not found or expired. Check the code.");
     setCurrentRoom(room);
     setSettings((s) => ({
@@ -623,40 +736,94 @@ export function GameApp({ userId }: { userId: string }) {
     setTimeout(() => setCopiedCode(false), 2000);
   };
 
-  const handleAddFriend = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!friendSearchInput.trim()) return;
+  const handleSearchPlayers = async (query: string) => {
+    setPlayerSearchInput(query);
+    if (!query.trim() || query.trim().length < 2) {
+      setSearchedPlayers([]);
+      return;
+    }
+    setIsSearching(true);
+    const results = await searchRegisteredPlayers(query, userId);
+    setSearchedPlayers(results);
+    setIsSearching(false);
+  };
+
+  const handleInvitePlayer = async (targetPlayer: RegisteredPlayer) => {
     sfx("click");
-    const res = sendFriendRequest(
+    toast.info(`Sending game invitation to @${targetPlayer.username}...`);
+    const res = await sendGameInvitation(
       { id: userId, name: settings.names[0], avatar: settings.avatars[0] },
-      friendSearchInput,
+      targetPlayer.userId,
+      {
+        hostColor: settings.colors[0],
+        guestColor: settings.colors[1],
+        timer: settings.timer,
+        rounds: settings.rounds,
+      },
     );
-    if (res.success) {
-      toast.success(res.message);
-      setFriendSearchInput("");
-      setFriendsList(getFriends(userId));
+
+    if (res.success && res.room) {
+      setCurrentRoom(res.room);
+      setOutgoingInvitation({
+        toUser: targetPlayer,
+        roomCode: res.room.code,
+        invitationId: res.invitationId,
+      });
+      setSettings((s) => ({
+        ...s,
+        mode: "online",
+        names: [s.names[0], targetPlayer.displayName || targetPlayer.username],
+        avatars: [s.avatars[0], targetPlayer.avatar],
+      }));
+      toast.success(`Invitation sent to @${targetPlayer.username}! Waiting for response...`);
     } else {
-      toast.error(res.message);
+      sfx("error");
+      toast.error(res.message || "Failed to send invitation.");
     }
   };
 
-  const handleChallengeFriend = (friend: Friend) => {
-    sfx("click");
-    const room = createRoom(userId, settings.names[0], settings.avatars[0], {
-      hostColor: settings.colors[0],
-      guestColor: settings.colors[1],
-      timer: settings.timer,
-      rounds: settings.rounds,
+  const handleAcceptInvitation = async (inv: GameInvitation) => {
+    sfx("win");
+    toast.info(`Accepting invitation from @${inv.fromUsername}...`);
+    const res = await respondToInvitation(inv.id, true, {
+      id: userId,
+      name: settings.names[0],
+      avatar: settings.avatars[0],
     });
-    setCurrentRoom(room);
-    setSettings((s) => ({
-      ...s,
-      mode: "online",
-      names: [s.names[0], friend.name],
-      avatars: [s.avatars[0], friend.avatar],
-    }));
-    setActiveTab("online");
-    toast.success(`Challenged ${friend.name}! Room code: ${room.code}`);
+
+    const joinedRoom = res.room;
+    if (res.success && joinedRoom) {
+      setIncomingInvitations((prev) => prev.filter((i) => i.id !== inv.id));
+      setCurrentRoom(joinedRoom);
+      setSettings((s) => ({
+        ...s,
+        mode: "online",
+        names: [s.names[0], inv.fromDisplayName || inv.fromUsername],
+        avatars: [s.avatars[0], inv.fromAvatar],
+        colors: [joinedRoom.guestColor, joinedRoom.hostColor],
+      }));
+      toast.success(`Joined room with @${inv.fromUsername}!`);
+      startMatch();
+    } else {
+      sfx("error");
+      toast.error(res.message || "Could not join game.");
+    }
+  };
+
+  const handleDeclineInvitation = async (inv: GameInvitation) => {
+    sfx("click");
+    await respondToInvitation(inv.id, false, {
+      id: userId,
+      name: settings.names[0],
+      avatar: settings.avatars[0],
+    });
+    setIncomingInvitations((prev) => prev.filter((i) => i.id !== inv.id));
+    toast.message(`Declined invitation from @${inv.fromUsername}`);
+  };
+
+  const handleCancelOutgoingInvitation = () => {
+    setOutgoingInvitation(null);
+    toast.message("Invitation cancelled.");
   };
 
   const capList = useMemo(
@@ -674,60 +841,63 @@ export function GameApp({ userId }: { userId: string }) {
     return selected === null ? t.turnPhaseMovement : "Tap a glowing target point.";
   })();
 
-  // Shared Navigation Header
+  // Shared Navigation Header with Safe-Area Inset
   const header = (
-    <header className="flex w-full max-w-5xl items-center justify-between gap-2 px-4 py-3 border-b border-border/40 backdrop-blur-md sticky top-0 z-40 bg-background/80">
-      <div className="flex items-center gap-3">
-        <Logo size={42} />
-        <div>
-          <Title small />
-          <p className="text-[10px] tracking-widest uppercase text-muted-foreground hidden sm:block">
-            {t.appSubtitle}
-          </p>
-        </div>
+    <header
+      className="flex w-full max-w-5xl items-center justify-between gap-2 px-4 py-2.5 border-b border-amber-900/30 backdrop-blur-md sticky top-0 z-40 bg-[#140e0a]/90 text-amber-50"
+      style={{
+        paddingTop: "max(0.6rem, env(safe-area-inset-top, 0px))",
+      }}
+    >
+      <div className="flex items-center gap-2.5">
+        {playing ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              void triggerHaptic("light");
+              if (matchOver) setPlaying(false);
+              else setDialog("back");
+            }}
+            className="h-8 px-2 text-xs text-amber-200 hover:text-white hover:bg-amber-950/40"
+          >
+            <ArrowLeft className="h-4 w-4 mr-1" />
+            <span>Lobby</span>
+          </Button>
+        ) : (
+          <div className="flex items-center gap-2">
+            <Logo size={36} />
+            <div>
+              <Title small />
+            </div>
+          </div>
+        )}
       </div>
 
-      <div className="flex items-center gap-1 sm:gap-2">
-        {/* Language Quick Switcher */}
-        <div className="flex items-center rounded-lg border border-border/60 p-0.5 bg-muted/40 text-xs">
-          {(["en", "te", "hi"] as Language[]).map((lng) => (
-            <button
-              key={lng}
-              type="button"
-              onClick={() => {
-                sfx("click");
-                setSettings((s) => ({ ...s, language: lng }));
-              }}
-              className={`px-2 py-1 rounded font-medium transition-all ${
-                settings.language === lng
-                  ? "bg-primary text-primary-foreground shadow-sm"
-                  : "text-muted-foreground hover:text-foreground"
-              }`}
-            >
-              {lng === "en" ? "EN" : lng === "te" ? "తెలుగు" : "हिंदी"}
-            </button>
-          ))}
+      {/* User Avatar & Username Pill */}
+      {currentUsername && (
+        <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-xs text-amber-200">
+          <span className="text-sm">{settings.avatars[0]}</span>
+          <span className="font-mono font-medium max-w-[90px] truncate sm:max-w-xs">
+            @{currentUsername}
+          </span>
         </div>
+      )}
 
-        {/* Light/Dark Mode Switcher */}
+      <div className="flex items-center gap-1">
+        {/* Rules button */}
         <Button
           variant="ghost"
           size="icon"
-          aria-label="Toggle theme mode"
+          aria-label="How to play rules"
           onClick={() => {
+            void triggerHaptic("light");
             sfx("click");
-            setSettings((s) => ({
-              ...s,
-              themeMode: s.themeMode === "dark" ? "light" : "dark",
-            }));
+            setActiveTab("rules");
           }}
-          className="rounded-full"
+          className="h-8 w-8 rounded-full text-amber-200/80 hover:text-amber-100 hover:bg-amber-950/40"
         >
-          {settings.themeMode === "dark" ? (
-            <Sun className="h-4 w-4" />
-          ) : (
-            <Moon className="h-4 w-4" />
-          )}
+          <BookOpen className="h-4 w-4" />
         </Button>
 
         {/* Audio Mute/Unmute */}
@@ -736,10 +906,11 @@ export function GameApp({ userId }: { userId: string }) {
           size="icon"
           aria-label={settings.sound ? "Mute audio" : "Unmute audio"}
           onClick={() => {
+            void triggerHaptic("light");
             sfx("click");
             setSettings((s) => ({ ...s, sound: !s.sound }));
           }}
-          className="rounded-full"
+          className="h-8 w-8 rounded-full text-amber-200/80 hover:text-amber-100 hover:bg-amber-950/40"
         >
           {settings.sound ? <Volume2 className="h-4 w-4" /> : <VolumeX className="h-4 w-4" />}
         </Button>
@@ -747,115 +918,114 @@ export function GameApp({ userId }: { userId: string }) {
         {/* Logout Button */}
         <Button
           variant="ghost"
-          size="sm"
-          onClick={() => setDialog("logout")}
-          className="text-xs text-muted-foreground hover:text-destructive hidden sm:flex"
+          size="icon"
+          aria-label="Sign out"
+          onClick={() => {
+            void triggerHaptic("light");
+            setDialog("logout");
+          }}
+          className="h-8 w-8 rounded-full text-stone-400 hover:text-rose-400 hover:bg-rose-950/30"
         >
-          <LogOut className="mr-1 h-3.5 w-3.5" />
-          {t.signOut}
+          <LogOut className="h-4 w-4" />
         </Button>
       </div>
     </header>
   );
 
-  // Bottom Navigation Bar (Mobile & Desktop Tab Selector)
+  // Native Fixed Bottom Navigation Bar (Home/Play, Lobby, Friends, Stats, Profile)
   const navTabs = (
-    <nav className="w-full max-w-3xl flex items-center justify-around p-1.5 rounded-2xl bg-card/90 border border-border/60 shadow-lg backdrop-blur-md">
-      <button
-        type="button"
-        onClick={() => {
-          sfx("click");
-          setActiveTab("play");
-        }}
-        className={`flex-1 flex flex-col items-center py-2 px-1 rounded-xl text-xs font-medium transition-all ${
-          activeTab === "play"
-            ? "bg-primary text-primary-foreground shadow"
-            : "text-muted-foreground hover:text-foreground"
-        }`}
-      >
-        <Gamepad2 className="h-4 w-4 mb-1" />
-        {t.playGame}
-      </button>
+    <nav
+      className="fixed bottom-0 inset-x-0 z-40 bg-[#140e0a]/95 border-t border-amber-900/35 backdrop-blur-xl shadow-[0_-8px_25px_rgba(0,0,0,0.65)]"
+      style={{
+        paddingBottom: "max(0.5rem, env(safe-area-inset-bottom, 0px))",
+      }}
+    >
+      <div className="mx-auto flex max-w-lg items-center justify-around px-2 py-1">
+        <button
+          type="button"
+          onClick={() => {
+            void triggerHaptic("selection");
+            sfx("click");
+            setActiveTab("play");
+          }}
+          className={`flex-1 flex flex-col items-center justify-center py-1 px-1 rounded-xl text-[11px] font-semibold transition-all active:scale-95 ${
+            activeTab === "play"
+              ? "text-amber-300 bg-amber-500/15 ring-1 ring-amber-500/30 shadow-sm"
+              : "text-stone-400 hover:text-stone-200"
+          }`}
+        >
+          <Gamepad2 className={`h-5 w-5 mb-0.5 ${activeTab === "play" ? "text-amber-400" : ""}`} />
+          <span>{t.playGame}</span>
+        </button>
 
-      <button
-        type="button"
-        onClick={() => {
-          sfx("click");
-          setActiveTab("dashboard");
-        }}
-        className={`flex-1 flex flex-col items-center py-2 px-1 rounded-xl text-xs font-medium transition-all ${
-          activeTab === "dashboard"
-            ? "bg-primary text-primary-foreground shadow"
-            : "text-muted-foreground hover:text-foreground"
-        }`}
-      >
-        <Trophy className="h-4 w-4 mb-1" />
-        {t.dashboard}
-      </button>
+        <button
+          type="button"
+          onClick={() => {
+            void triggerHaptic("selection");
+            sfx("click");
+            setActiveTab("online");
+          }}
+          className={`flex-1 flex flex-col items-center justify-center py-1 px-1 rounded-xl text-[11px] font-semibold transition-all active:scale-95 ${
+            activeTab === "online"
+              ? "text-amber-300 bg-amber-500/15 ring-1 ring-amber-500/30 shadow-sm"
+              : "text-stone-400 hover:text-stone-200"
+          }`}
+        >
+          <Globe className={`h-5 w-5 mb-0.5 ${activeTab === "online" ? "text-amber-400" : ""}`} />
+          <span>{t.onlineMultiplayer}</span>
+        </button>
 
-      <button
-        type="button"
-        onClick={() => {
-          sfx("click");
-          setActiveTab("online");
-        }}
-        className={`flex-1 flex flex-col items-center py-2 px-1 rounded-xl text-xs font-medium transition-all ${
-          activeTab === "online"
-            ? "bg-primary text-primary-foreground shadow"
-            : "text-muted-foreground hover:text-foreground"
-        }`}
-      >
-        <Globe className="h-4 w-4 mb-1" />
-        {t.onlineMultiplayer}
-      </button>
+        <button
+          type="button"
+          onClick={() => {
+            void triggerHaptic("selection");
+            sfx("click");
+            setActiveTab("friends");
+          }}
+          className={`flex-1 flex flex-col items-center justify-center py-1 px-1 rounded-xl text-[11px] font-semibold transition-all active:scale-95 ${
+            activeTab === "friends"
+              ? "text-amber-300 bg-amber-500/15 ring-1 ring-amber-500/30 shadow-sm"
+              : "text-stone-400 hover:text-stone-200"
+          }`}
+        >
+          <Users className={`h-5 w-5 mb-0.5 ${activeTab === "friends" ? "text-amber-400" : ""}`} />
+          <span>{t.friends}</span>
+        </button>
 
-      <button
-        type="button"
-        onClick={() => {
-          sfx("click");
-          setActiveTab("friends");
-        }}
-        className={`flex-1 flex flex-col items-center py-2 px-1 rounded-xl text-xs font-medium transition-all ${
-          activeTab === "friends"
-            ? "bg-primary text-primary-foreground shadow"
-            : "text-muted-foreground hover:text-foreground"
-        }`}
-      >
-        <Users className="h-4 w-4 mb-1" />
-        {t.friends}
-      </button>
+        <button
+          type="button"
+          onClick={() => {
+            void triggerHaptic("selection");
+            sfx("click");
+            setActiveTab("dashboard");
+          }}
+          className={`flex-1 flex flex-col items-center justify-center py-1 px-1 rounded-xl text-[11px] font-semibold transition-all active:scale-95 ${
+            activeTab === "dashboard"
+              ? "text-amber-300 bg-amber-500/15 ring-1 ring-amber-500/30 shadow-sm"
+              : "text-stone-400 hover:text-stone-200"
+          }`}
+        >
+          <Trophy className={`h-5 w-5 mb-0.5 ${activeTab === "dashboard" ? "text-amber-400" : ""}`} />
+          <span>{t.dashboard}</span>
+        </button>
 
-      <button
-        type="button"
-        onClick={() => {
-          sfx("click");
-          setActiveTab("settings");
-        }}
-        className={`flex-1 flex flex-col items-center py-2 px-1 rounded-xl text-xs font-medium transition-all ${
-          activeTab === "settings"
-            ? "bg-primary text-primary-foreground shadow"
-            : "text-muted-foreground hover:text-foreground"
-        }`}
-      >
-        <SettingsIcon className="h-4 w-4 mb-1" />
-        {t.settings}
-      </button>
-
-      <button
-        type="button"
-        onClick={() => {
-          sfx("click");
-          setActiveTab("rules");
-        }}
-        className={`flex-1 flex flex-col items-center py-2 px-1 rounded-xl text-xs font-medium transition-all ${
-          activeTab === "rules"
-            ? "bg-primary text-primary-foreground shadow"
-            : "text-muted-foreground hover:text-foreground"
-        }`}
-      >
-        <BookOpen className="h-4 w-4 mb-1" />
-        {t.rules}
-      </button>
+        <button
+          type="button"
+          onClick={() => {
+            void triggerHaptic("selection");
+            sfx("click");
+            setActiveTab("settings");
+          }}
+          className={`flex-1 flex flex-col items-center justify-center py-1 px-1 rounded-xl text-[11px] font-semibold transition-all active:scale-95 ${
+            activeTab === "settings"
+              ? "text-amber-300 bg-amber-500/15 ring-1 ring-amber-500/30 shadow-sm"
+              : "text-stone-400 hover:text-stone-200"
+          }`}
+        >
+          <SettingsIcon className={`h-5 w-5 mb-0.5 ${activeTab === "settings" ? "text-amber-400" : ""}`} />
+          <span>{t.settings}</span>
+        </button>
+      </div>
     </nav>
   );
 
@@ -1148,12 +1318,12 @@ export function GameApp({ userId }: { userId: string }) {
 
   // Lobby & Multi-Tab Views (Play, Dashboard, Online, Friends, Settings, Rules)
   return (
-    <div className={`theme-${settings.boardTheme} flex min-h-screen flex-col items-center pb-12`}>
+    <div
+      className={`theme-${settings.boardTheme} flex min-h-[100dvh] flex-col items-center bg-gradient-to-b from-[#18110c] to-[#0c0806]`}
+    >
       {header}
 
-      <main className="w-full max-w-3xl space-y-6 px-4 pt-4">
-        {/* Navigation Tabs */}
-        {navTabs}
+      <main className="w-full max-w-3xl space-y-6 px-4 pt-4 pb-28">
 
         {/* TAB 1: PLAY SETUP */}
         {activeTab === "play" && (
@@ -1650,63 +1820,99 @@ export function GameApp({ userId }: { userId: string }) {
           </section>
         )}
 
-        {/* TAB 4: FRIENDS LIST & REQUESTS */}
+        {/* TAB 4: PLAYER SEARCH & ONLINE LOBBY */}
         {activeTab === "friends" && (
           <section className="space-y-6 animate-in fade-in duration-300">
             <div className="panel p-6 shadow-xl space-y-6">
               <div className="flex items-center justify-between pb-3 border-b border-border/40">
                 <div className="flex items-center gap-2">
                   <Users className="h-6 w-6 text-primary" />
-                  <h2 className="text-xl font-bold font-display">{t.friends}</h2>
+                  <h2 className="text-xl font-bold font-display">Player Lobby</h2>
                 </div>
-                <div className="text-xs text-muted-foreground">Connect and Play</div>
+                <div className="flex items-center gap-2 text-xs text-muted-foreground bg-muted/40 px-3 py-1.5 rounded-full">
+                  <span>{settings.avatars[0]}</span>
+                  <span className="font-semibold text-foreground">
+                    @{currentUsername || settings.names[0].toLowerCase().replace(/[^a-z0-9_]/g, "")}
+                  </span>
+                </div>
               </div>
 
-              {/* Search & Add Friend */}
-              <form onSubmit={handleAddFriend} className="flex gap-2">
-                <div className="relative flex-1">
-                  <Search className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
-                  <Input
-                    placeholder={t.searchFriends}
-                    value={friendSearchInput}
-                    onChange={(e) => setFriendSearchInput(e.target.value)}
-                    className="pl-9"
-                  />
+              {/* Active Outgoing Invitation Status */}
+              {outgoingInvitation && (
+                <div className="panel p-4 rounded-xl border border-primary/50 bg-primary/10 flex flex-col sm:flex-row items-center justify-between gap-3 animate-in fade-in">
+                  <div className="flex items-center gap-3 text-center sm:text-left">
+                    <span className="h-3 w-3 rounded-full bg-amber-400 animate-ping shrink-0" />
+                    <div>
+                      <div className="font-semibold text-sm">
+                        Waiting for @{outgoingInvitation.toUser.username} to accept challenge...
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        Room Code:{" "}
+                        <span className="font-mono font-bold text-primary">
+                          {outgoingInvitation.roomCode}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={handleCancelOutgoingInvitation}
+                    className="text-xs shrink-0"
+                  >
+                    Cancel Challenge
+                  </Button>
                 </div>
-                <Button type="submit">
-                  <UserPlus className="mr-1.5 h-4 w-4" />
-                  {t.sendRequest}
-                </Button>
-              </form>
+              )}
 
-              {/* Incoming Friend Requests */}
-              {friendRequests.length > 0 && (
-                <div className="space-y-2">
-                  <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                    {t.incomingRequests} ({friendRequests.length})
-                  </h3>
+              {/* Incoming Real Game Invitations */}
+              {incomingInvitations.length > 0 && (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2">
+                    <span className="flex h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse" />
+                    <h3 className="text-xs font-bold uppercase tracking-wider text-primary">
+                      Incoming Game Invitations ({incomingInvitations.length})
+                    </h3>
+                  </div>
                   <div className="space-y-2">
-                    {friendRequests.map((req) => (
+                    {incomingInvitations.map((inv) => (
                       <div
-                        key={req.id}
-                        className="panel p-3 flex items-center justify-between rounded-xl border border-primary/40 bg-primary/5"
+                        key={inv.id}
+                        className="panel p-4 flex flex-col sm:flex-row items-center justify-between gap-3 rounded-xl border-2 border-primary/40 bg-primary/5 shadow-md"
                       >
-                        <div className="flex items-center gap-2.5">
-                          <span className="text-2xl">{req.fromAvatar}</span>
-                          <span className="font-semibold text-sm">{req.fromName}</span>
+                        <div className="flex items-center gap-3">
+                          <span className="text-3xl">{inv.fromAvatar}</span>
+                          <div>
+                            <div className="font-bold text-sm flex items-center gap-2">
+                              <span>{inv.fromDisplayName}</span>
+                              <span className="text-xs font-mono text-muted-foreground">
+                                @{inv.fromUsername}
+                              </span>
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                              Challenged you to play in Room{" "}
+                              <span className="font-mono font-semibold text-primary">
+                                {inv.roomCode}
+                              </span>
+                            </div>
+                          </div>
                         </div>
-                        <div className="flex gap-2">
+                        <div className="flex gap-2 w-full sm:w-auto justify-end">
                           <Button
                             size="sm"
-                            onClick={() => {
-                              sfx("win");
-                              acceptFriendRequest(userId, req.id);
-                              setFriendRequests(getFriendRequests(userId));
-                              setFriendsList(getFriends(userId));
-                              toast.success(`Accepted ${req.fromName}'s friend request!`);
-                            }}
+                            variant="outline"
+                            onClick={() => handleDeclineInvitation(inv)}
+                            className="text-xs"
                           >
-                            {t.accept}
+                            Decline
+                          </Button>
+                          <Button
+                            size="sm"
+                            onClick={() => handleAcceptInvitation(inv)}
+                            className="text-xs font-bold"
+                          >
+                            <Swords className="mr-1.5 h-3.5 w-3.5" />
+                            Accept & Play
                           </Button>
                         </div>
                       </div>
@@ -1715,49 +1921,76 @@ export function GameApp({ userId }: { userId: string }) {
                 </div>
               )}
 
-              {/* Friends List */}
+              {/* Search Registered Players by Username from Supabase */}
               <div className="space-y-3">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Your Friends ({friendsList.length})
-                </h3>
-                {friendsList.length === 0 ? (
-                  <div className="text-center py-6 text-muted-foreground text-sm panel bg-muted/10">
-                    No friends added yet. Use the search box above to add friends!
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    {friendsList.map((f) => (
+                <div>
+                  <h3 className="font-bold text-base flex items-center gap-2">
+                    <Search className="h-4 w-4 text-primary" />
+                    <span>Find Registered Players</span>
+                  </h3>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Search registered users by username directly from the Supabase database.
+                  </p>
+                </div>
+
+                <div className="relative">
+                  <Search className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
+                  <Input
+                    placeholder="Search player username (e.g. anushka, player1)..."
+                    value={playerSearchInput}
+                    onChange={(e) => handleSearchPlayers(e.target.value)}
+                    className="pl-9 pr-9 h-11 text-sm font-medium"
+                  />
+                  {isSearching && (
+                    <RefreshCw className="absolute right-3 top-3 h-4 w-4 text-primary animate-spin" />
+                  )}
+                </div>
+
+                {/* Search Results */}
+                {searchedPlayers.length > 0 ? (
+                  <div className="space-y-2 pt-1">
+                    <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                      Players Found ({searchedPlayers.length})
+                    </div>
+                    {searchedPlayers.map((player) => (
                       <div
-                        key={f.id}
-                        className="panel p-3.5 flex items-center justify-between rounded-xl border border-border/40 hover:bg-accent/30 transition-all"
+                        key={player.userId}
+                        className="panel p-3.5 flex items-center justify-between rounded-xl border border-border/50 hover:bg-accent/40 transition-all"
                       >
                         <div className="flex items-center gap-3">
-                          <span className="text-3xl">{f.avatar}</span>
+                          <span className="text-3xl">{player.avatar}</span>
                           <div>
-                            <div className="font-semibold text-sm flex items-center gap-2">
-                              <span>{f.name}</span>
-                              <span
-                                className={`h-2 w-2 rounded-full ${
-                                  f.online ? "bg-emerald-500 shadow-sm" : "bg-muted-foreground/50"
-                                }`}
-                              />
+                            <div className="font-bold text-sm flex items-center gap-2">
+                              <span>{player.displayName}</span>
+                              <span className="text-xs font-mono font-medium text-primary">
+                                @{player.username}
+                              </span>
                             </div>
-                            <div className="text-xs text-muted-foreground">
-                              {f.online ? t.onlineNow : t.offline}
-                            </div>
+                            <div className="text-xs text-muted-foreground">Registered Player</div>
                           </div>
                         </div>
+
                         <Button
                           size="sm"
-                          variant="outline"
-                          onClick={() => handleChallengeFriend(f)}
+                          onClick={() => handleInvitePlayer(player)}
+                          disabled={outgoingInvitation?.toUser.userId === player.userId}
                           className="font-medium"
                         >
-                          <Swords className="mr-1.5 h-3.5 w-3.5 text-primary" />
-                          {t.challenge}
+                          <Swords className="mr-1.5 h-3.5 w-3.5" />
+                          {outgoingInvitation?.toUser.userId === player.userId
+                            ? "Invited"
+                            : "Invite to Play"}
                         </Button>
                       </div>
                     ))}
+                  </div>
+                ) : playerSearchInput.trim().length >= 2 && !isSearching ? (
+                  <div className="text-center py-6 text-muted-foreground text-sm panel bg-muted/10 rounded-xl">
+                    No registered players found matching &ldquo;{playerSearchInput}&rdquo;.
+                  </div>
+                ) : (
+                  <div className="text-center py-6 text-muted-foreground text-xs panel bg-muted/10 rounded-xl">
+                    Type a username above to search registered players from Supabase.
                   </div>
                 )}
               </div>
@@ -1780,6 +2013,13 @@ export function GameApp({ userId }: { userId: string }) {
               {/* Display Name & Avatar */}
               <div className="space-y-4 rounded-xl border border-border/40 p-4 bg-muted/10">
                 <h3 className="font-semibold text-sm">Player Profile</h3>
+                <div>
+                  <div className="text-xs text-muted-foreground">Unique Username</div>
+                  <div className="font-mono text-sm font-semibold text-primary mt-0.5">
+                    @{currentUsername || settings.names[0].toLowerCase().replace(/[^a-z0-9_]/g, "")}
+                  </div>
+                </div>
+
                 <div>
                   <Label htmlFor="display-name-input" className="text-xs text-muted-foreground">
                     {t.displayName}
@@ -2003,6 +2243,7 @@ export function GameApp({ userId }: { userId: string }) {
 
         <LegalLinks />
       </main>
+      {navTabs}
       {dialogs}
     </div>
   );

@@ -12,7 +12,13 @@ export const Route = createFileRoute("/_authenticated/play")({
     ],
   }),
   beforeLoad: async ({ context }) => {
-    if (!(await hasCurrentConsent(context.user.id))) throw redirect({ to: "/consent" });
+    try {
+      const ok = await hasCurrentConsent(context.user.id);
+      if (!ok) throw redirect({ to: "/consent" });
+    } catch (e) {
+      if (typeof e === "object" && e !== null && "to" in e) throw e;
+      console.warn("[Play] Consent check notice:", e);
+    }
   },
   component: Play,
 });

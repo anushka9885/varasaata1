@@ -77,33 +77,114 @@ export type Database = {
           board_theme: string;
           created_at: string;
           display_name: string;
+          language: string;
           p1_color: string;
           p2_color: string;
           sound_enabled: boolean;
+          theme_mode: string;
           updated_at: string;
           user_id: string;
+          username: string | null;
         };
         Insert: {
           avatar?: string;
           board_theme?: string;
           created_at?: string;
           display_name?: string;
+          language?: string;
           p1_color?: string;
           p2_color?: string;
           sound_enabled?: boolean;
+          theme_mode?: string;
           updated_at?: string;
           user_id: string;
+          username?: string | null;
         };
         Update: {
           avatar?: string;
           board_theme?: string;
           created_at?: string;
           display_name?: string;
+          language?: string;
           p1_color?: string;
           p2_color?: string;
           sound_enabled?: boolean;
+          theme_mode?: string;
           updated_at?: string;
           user_id?: string;
+          username?: string | null;
+        };
+        Relationships: [];
+      };
+      game_invitations: {
+        Row: {
+          created_at: string;
+          from_user_id: string;
+          id: string;
+          room_code: string;
+          status: string;
+          to_user_id: string;
+          updated_at: string;
+        };
+        Insert: {
+          created_at?: string;
+          from_user_id: string;
+          id?: string;
+          room_code: string;
+          status?: string;
+          to_user_id: string;
+          updated_at?: string;
+        };
+        Update: {
+          created_at?: string;
+          from_user_id?: string;
+          id?: string;
+          room_code?: string;
+          status?: string;
+          to_user_id?: string;
+          updated_at?: string;
+        };
+        Relationships: [];
+      };
+      online_rooms: {
+        Row: {
+          code: string;
+          created_at: string;
+          game_state: Json | null;
+          guest_color: string;
+          guest_id: string | null;
+          host_color: string;
+          host_id: string;
+          rounds: number;
+          status: string;
+          timer: number;
+          updated_at: string;
+        };
+        Insert: {
+          code: string;
+          created_at?: string;
+          game_state?: Json | null;
+          guest_color?: string;
+          guest_id?: string | null;
+          host_color?: string;
+          host_id: string;
+          rounds?: number;
+          status?: string;
+          timer?: number;
+          updated_at?: string;
+        };
+        Update: {
+          code?: string;
+          created_at?: string;
+          game_state?: Json | null;
+          guest_color?: string;
+          guest_id?: string | null;
+          host_color?: string;
+          host_id?: string;
+          rounds?: number;
+          status?: string;
+          timer?: number;
+          updated_at?: string;
         };
         Relationships: [];
       };
@@ -112,7 +193,12 @@ export type Database = {
       [_ in never]: never;
     };
     Functions: {
-      [_ in never]: never;
+      resolve_login_email: {
+        Args: {
+          p_username: string;
+        };
+        Returns: string | null;
+      };
     };
     Enums: {
       [_ in never]: never;

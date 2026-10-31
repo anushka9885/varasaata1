@@ -324,6 +324,32 @@ class MockQueryBuilder {
     return this;
   }
 
+  or(expr: string) {
+    const parts = expr.split(",");
+    this.filters.push((row) => {
+      return parts.some((p) => {
+        const segs = p.split(".");
+        const col = segs[0];
+        const op = segs[1];
+        const val = segs.slice(2).join(".");
+        if (op === "ilike") {
+          const s = val.replace(/%/g, "").toLowerCase();
+          return String(row[col] || "")
+            .toLowerCase()
+            .includes(s);
+        }
+        if (op === "eq") return String(row[col]) === val;
+        return false;
+      });
+    });
+    return this;
+  }
+
+  in(column: string, values: unknown[]) {
+    this.filters.push((row) => values.includes(row[column]));
+    return this;
+  }
+
   order(column: string, opts?: { ascending?: boolean }) {
     this.orderCol = column;
     this.ascending = opts?.ascending ?? true;

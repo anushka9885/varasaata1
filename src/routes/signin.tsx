@@ -57,16 +57,62 @@ function SignIn() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (submitting.current) return;
-    const em = normalizeEmail(email);
-    if (!EMAIL_RE.test(em)) return setError("Enter a valid email address.");
+    const raw = email.trim();
+    if (!raw) return setError("Enter your username or email address.");
     if (!password) return setError("Enter your password.");
+
     setError("");
     setLoading(true);
     submitting.current = true;
-    const res = await supabase.auth.signInWithPassword({ email: em, password });
+
+    let targetEmail = raw;
+
+    // If user provided a username without '@', try resolving it to their registered auth email
+    if (!raw.includes("@")) {
+      const cleanUser = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
+      try {
+        const { data: resolved } = await supabase.rpc("resolve_login_email", {
+          p_username: cleanUser,
+        });
+        if (resolved && typeof resolved === "string") {
+          targetEmail = resolved;
+        }
+      } catch {
+        /* ignore RPC missing error and continue with standard attempts */
+      }
+    }
+
+    let res = await supabase.auth.signInWithPassword({
+      email: targetEmail.toLowerCase(),
+      password,
+    });
+
+    // Fallback: if username login failed, try legacy domains
+    if (res.error && !raw.includes("@") && targetEmail === raw) {
+      const cleanUser = raw.toLowerCase().replace(/[^a-z0-9_]/g, "");
+      const legacyEmails = [`${cleanUser}@player.varasaata.local`, `${cleanUser}@varasaata.app`];
+      for (const legacy of legacyEmails) {
+        const legacyRes = await supabase.auth.signInWithPassword({
+          email: legacy,
+          password,
+        });
+        if (!legacyRes.error) {
+          res = legacyRes;
+          break;
+        }
+      }
+    }
+
     submitting.current = false;
     setLoading(false);
-    if (res.error) return setError(friendlyAuthError(res.error.message));
+    if (res.error) {
+      if (!raw.includes("@") && targetEmail === raw) {
+        return setError(
+          "Could not sign in with that username. Please enter your email address to sign in.",
+        );
+      }
+      return setError(friendlyAuthError(res.error.message));
+    }
     if (res.data?.user) {
       try {
         await recordConsent(res.data.user.id);

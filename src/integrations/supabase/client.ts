@@ -58,11 +58,19 @@ import { mockAuth, mockDatabase } from "./mock-client";
 
 function createSupabaseClient() {
   const SUPABASE_URL =
-    import.meta.env["VITE_SUPABASE_URL"] ||
-    (typeof process !== "undefined" ? process.env?.["SUPABASE_URL"] : undefined);
+    (typeof import.meta !== "undefined" && import.meta.env
+      ? import.meta.env["VITE_SUPABASE_URL"]
+      : undefined) ||
+    (typeof process !== "undefined"
+      ? process.env?.["SUPABASE_URL"] || process.env?.["VITE_SUPABASE_URL"]
+      : undefined);
   const SUPABASE_PUBLISHABLE_KEY =
-    import.meta.env["VITE_SUPABASE_PUBLISHABLE_KEY"] ||
-    (typeof process !== "undefined" ? process.env?.["SUPABASE_PUBLISHABLE_KEY"] : undefined);
+    (typeof import.meta !== "undefined" && import.meta.env
+      ? import.meta.env["VITE_SUPABASE_PUBLISHABLE_KEY"]
+      : undefined) ||
+    (typeof process !== "undefined"
+      ? process.env?.["SUPABASE_PUBLISHABLE_KEY"] || process.env?.["VITE_SUPABASE_PUBLISHABLE_KEY"]
+      : undefined);
 
   if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
     // Graceful fallback to persistent localStorage & broadcast client
